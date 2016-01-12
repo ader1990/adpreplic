@@ -76,8 +76,8 @@ init([]) ->
                      'adpreplic@adpreplic-2.com']
     }}.
 
-handle_call(get_my_dc, _From, #state{port=Port} = State) ->
-    {reply, {ok, {my_ip(),Port, node()}}, State};
+handle_call(get_my_dc, _From, #state{dcs=_DCs} = State) ->
+    {reply, {ok, node()}, State};
 
 handle_call({start_receiver, Port}, _From, State) ->
     %{ok, _} = antidote_sup:start_rep(Port),
@@ -97,18 +97,20 @@ handle_call({add_list_dcs, DCs}, _From, #state{dcs=DCs0} = State) ->
 handle_call({send_data_item_location, Key}, _From, #state{dcs=DCs} = _State) ->
     lager:info("Key is: ~p and From is: ~p", [Key, _From]),
     lager:info("DCs are: ~p", [DCs]),
-    lists:foreach(
-        %% rpc is better in this case
-        fun(DC) -> rpc:call(DC, inter_dc_manager, receive_data_item_location, [Key, DC]) end,
-    DCs),
+    DCsWithoutNode = get_other_dcs(DCs),
+    lager:info("DCs without this node are: ~p", [DCsWithoutNode]),
+    Result = rpc:multicall(DCsWithoutNode, inter_dc_manager,
+        receive_data_item_location,
+        [Key, node()], infinity),
+    lager:info("Response ~p", [Result]),
 
     {reply, {ok, DCs}, _State};
 
 handle_call({receive_data_item_location, Key, DC}, _From, #state{dcs=DCs} = _State) ->
     lager:info("Key is: ~p and From is: ~p and DCs are: ~p and DC is: ~p",
         [Key, _From, DCs, DC]),
-    %% 
-    {reply, {ok, DCs}, _State}.
+    replica_manager:add_dc_to_replica(Key, DC),
+    {reply, {ok, DC}, _State}.
 
 handle_cast(_Info, State) ->
     {noreply, State}.
@@ -128,3 +130,12 @@ my_ip() ->
     {ok, List} = inet:getif(),
     {Ip, _, _} = hd(List),
     inet_parse:ntoa(Ip).
+
+get_other_dcs(DCs) ->
+    ThisDC = node(),
+    lists:filtermap(
+        fun(X) -> case X of
+            ThisDC -> false;
+            _ -> {true, X}
+        end
+    end, DCs).
