@@ -133,6 +133,9 @@ handle_call({create, Key, Value, Strategy, StrategyParams}, _From, Tid) ->
             %% Send data to all available DCs
             SendResult = inter_dc_manager:send_data_item_location(Key),
             lager:info("SendResult is ~p", [SendResult]),
+            _ReplicationResult = inter_dc_manager:send_data_item_to_dcs(Key,
+                Value, Strategy, StrategyParams),
+            lager:info("SendResult is ~p", [_ReplicationResult]),
             {reply, {ok}, Tid};
         {error, Error} ->
             lager:info("Error starting strategy ~p", [Error]),
@@ -157,11 +160,15 @@ handle_call({add_dc_to_replica, Key, DC}, _From, Tid) ->
                 false ->
                     lager:info("Adding to DCs: ~p", [DC]),
                     DataInfoWithDC = DataInfo#data_info{dcs= DCs ++ [DC]},
-                    datastore_mnesia_data_info:update(Key, DataInfoWithDC);
+                    datastore_mnesia_data_info:update(Key, DataInfoWithDC),
+                    {ok, StrategyParams} = get_strategy(Key),
+                    _Result = strategy_adprep:init_strategy(Key, true, StrategyParams);
                 _ -> lager:info("Not adding to DCs: ~p", [DC])
             end,
             {reply, {ok}, Tid};
         {error, _ErrorInfo} ->
+            {ok, StrategyParams} = get_strategy(Key),
+            _Result = strategy_adprep:init_strategy(Key, true, StrategyParams),
             datastore_mnesia_data_info:create(Key, #data_info{
                     replicated = false,
                     strength = 0.0,
@@ -221,6 +228,7 @@ handle_call({update, Key, Value}, _From, Tid) ->
     %% TO DO
     %% Update on other DC in case it is not on this DC
     %% Proxy the update process
+    Timestamp = os:timestamp(),
     lager:info("Update data item with key: ~p", [Key]),
     {ok, StrategyParams} = get_strategy(Key),
     Result = datastore_mnesia_data_info:read(Key),
@@ -232,12 +240,14 @@ handle_call({update, Key, Value}, _From, Tid) ->
             Replicated = DataInfo#data_info.replicated,
             case Replicated of
                 false ->
-                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams),
+                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams,
+                        Timestamp),
                     {reply, {ok, "Value updated"}, Tid};
                 true ->
                     lager:info("Updating local replica: ~p", [Key]),
                     datastore_mnesia:update(Key, Value),
-                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams),
+                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams,
+                        Timestamp),
                     {reply, {ok, "Value updated"}, Tid}
             end;
         {error, ErrorInfo} ->
@@ -284,12 +294,13 @@ get_strategy(_Key) ->
     max_strength   = 300.0,
     decay_factor   = 10.0,
     rstrength      = 10.0,
-    wstrength      = 20.0
+    wstrength      = 20.0,
+    min_dcs_number = 8
     },
     {ok, StrategyParams}.
 
 
-forward_update_to_dcs(Key, Value, DataInfo, StrategyParams) ->
+forward_update_to_dcs(Key, Value, DataInfo, StrategyParams, Timestamp) ->
     %% TO DO
     %% Forward the updated version to the other DCs
     %% that contain the replica
@@ -297,5 +308,5 @@ forward_update_to_dcs(Key, Value, DataInfo, StrategyParams) ->
     DCsWithKey = inter_dc_manager:get_other_dcs(DCs),
     lager:info("Updating external replicas on DCs: ~p", [DCsWithKey]),
     inter_dc_manager:update_external_replicas(DCsWithKey, Key, Value,
-        StrategyParams, DataInfo#data_info.timestamp),
+        StrategyParams, Timestamp),
     {ok, "Updated external replicas"}.
