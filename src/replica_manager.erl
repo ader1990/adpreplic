@@ -125,7 +125,8 @@ handle_call({create, Key, Value, Strategy, StrategyParams}, _From, Tid) ->
                     replicated = true,
                     strength = Strength,
                     strategy = Strategy,
-                    dcs = [ThisDC]
+                    dcs = [ThisDC],
+                    timestamp = os:timestamp()
                 }),
             %% Save data item value locally
             ok = datastore_mnesia:create(Key,Value),
@@ -222,16 +223,39 @@ handle_call({update, Key, Value}, _From, Tid) ->
     %% Proxy the update process
     lager:info("Update data item with key: ~p", [Key]),
     {ok, StrategyParams} = get_strategy(Key),
-    _Result = strategy_adprep:init_strategy(Key, true, StrategyParams),
-    strategy_adprep:local_write(Key),
-    datastore_mnesia:update(Key, Value),
-    {reply, {ok}, Tid};
+    Result = datastore_mnesia_data_info:read(Key),
+    case Result of
+        {ok, DataInfoWithKey} ->
+            strategy_adprep:init_strategy(Key, true, StrategyParams),
+            strategy_adprep:local_write(Key),
+            DataInfo = DataInfoWithKey#data_info_with_key.value,
+            Replicated = DataInfo#data_info.replicated,
+            case Replicated of
+                false ->
+                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams),
+                    {reply, {ok, "Value updated"}, Tid};
+                true ->
+                    lager:info("Updating local replica: ~p", [Key]),
+                    datastore_mnesia:update(Key, Value),
+                    forward_update_to_dcs(Key, Value, DataInfo, StrategyParams),
+                    {reply, {ok, "Value updated"}, Tid}
+            end;
+        {error, ErrorInfo} ->
+            lager:info("Failure: ~p", [ErrorInfo]),
+            {reply, {error, ErrorInfo}, Tid};
+        Info ->
+            lager:info("Failure: ~p", [Info]),
+            {reply, {error, Info}, Tid}
+    end;
 
 handle_call({remove, Key}, _From, Tid) ->
     lager:info("Remove data item with key: ~p", [Key]),
     %% TO DO
     %% Remove DC from other DCs data retrieval storage
+    {_, Pid, _, _} = sys:get_status(list_to_atom(Key)),
+    strategy_adprep:stop(Pid),
     datastore_mnesia:remove(Key),
+    datastore_mnesia_data_info:remove(Key),
     {reply, {ok}, Tid}.
 
 handle_cast(shutdown, Tid) ->
@@ -263,3 +287,15 @@ get_strategy(_Key) ->
     wstrength      = 20.0
     },
     {ok, StrategyParams}.
+
+
+forward_update_to_dcs(Key, Value, DataInfo, StrategyParams) ->
+    %% TO DO
+    %% Forward the updated version to the other DCs
+    %% that contain the replica
+    DCs = DataInfo#data_info.dcs,
+    DCsWithKey = inter_dc_manager:get_other_dcs(DCs),
+    lager:info("Updating external replicas on DCs: ~p", [DCsWithKey]),
+    inter_dc_manager:update_external_replicas(DCsWithKey, Key, Value,
+        StrategyParams, DataInfo#data_info.timestamp),
+    {ok, "Updated external replicas"}.

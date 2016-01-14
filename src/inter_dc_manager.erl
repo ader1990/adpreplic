@@ -25,16 +25,21 @@
          get_my_dc/0,
          start_receiver/1,
          get_dcs/0,
+         set_dcs/1,
          add_dc/1,
          add_list_dcs/1,
          receive_data_item_location/2,
          send_data_item_location/1,
          get_other_dcs/1,
-         read_from_any_dc/2
+         read_from_any_dc/2,
+         update_external_replicas/5,
+         receive_data_item_update/4
          ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
         terminate/2, code_change/3]).
+
+-include("adprep.hrl").
 
 -record(state, {
         dcs,
@@ -57,6 +62,9 @@ start_receiver(Port) ->
 get_dcs() ->
     gen_server:call(?MODULE, get_dcs, infinity).
 
+set_dcs(DCs) ->
+    gen_server:call(?MODULE, {set_dcs, DCs}, infinity).
+
 add_dc(NewDC) ->
     gen_server:call(?MODULE, {add_dc, NewDC}, infinity).
 
@@ -72,14 +80,23 @@ receive_data_item_location(Key, DC) ->
 read_from_any_dc(Key, DCs) ->
     gen_server:call(?MODULE, {read_from_any_dc, Key, DCs}).
 
+update_external_replicas(DCs, Key, Value, StrategyParams, Timestamp) ->
+    gen_server:call(?MODULE, {update_external_replicas, DCs, Key, Value,
+        StrategyParams, Timestamp}).
+
+receive_data_item_update(Key, Value, StrategyParams, Timestamp) ->
+    gen_server:call(?MODULE, {receive_data_item_update, Key, Value,
+        StrategyParams, Timestamp}).
+
 %% ===================================================================
 %% gen_server callbacks
 %% ===================================================================
 
 init([]) ->
-    {ok, #state{dcs=['adpreplic@adpreplic-1.com',
-                     'adpreplic@adpreplic-2.com']
-    }}.
+    {ok, #state{
+        dcs=[]
+        }
+    }.
 
 handle_call(get_my_dc, _From, #state{dcs=_DCs} = State) ->
     {reply, {ok, node()}, State};
@@ -90,6 +107,9 @@ handle_call({start_receiver, Port}, _From, State) ->
 
 handle_call(get_dcs, _From, #state{dcs=DCs} = State) ->
     {reply, {ok, DCs}, State};
+
+handle_call({set_dcs, DCs}, _From, #state{dcs=_DCs0} = State) ->
+    {reply, ok, State#state{dcs=DCs}};
 
 handle_call({add_dc, NewDC}, _From, #state{dcs=DCs0} = State) ->
     DCs = DCs0 ++ [NewDC],
@@ -120,7 +140,28 @@ handle_call({receive_data_item_location, Key, DC}, _From, #state{dcs=DCs} = _Sta
 handle_call({read_from_any_dc, Key, DCsWithReplica}, _From, #state{dcs=_DCs} = _State) ->
     lager:info("Read from any dc the key value: ~p", [DCsWithReplica]),
     Result = get_replica_from_first_dc(Key, DCsWithReplica),
-    {reply, Result, _State}.
+    {reply, Result, _State};
+
+handle_call({update_external_replicas, DCs, Key, Value, StrategyParams, Timestamp},
+        _From, #state{dcs=_DCs} = _State) ->
+    lager:info("Inter DC update external replicas: ~p", [DCs]),
+    Result = rpc:multicall(DCs, inter_dc_manager,
+        receive_data_item_update,
+        [Key, Value, StrategyParams, Timestamp], infinity),
+    lager:info("Response ~p", [Result]),
+    {reply, {ok, "Updated replicas"}, _State};
+
+handle_call({receive_data_item_update, Key, Value, StrategyParams, Timestamp},
+        _From, #state{dcs=_DCs} = _State) ->
+    lager:info("Received replica info ~p ~p ~p ~p ",
+        [Key, Value, StrategyParams, Timestamp]),
+    strategy_adprep:init_strategy(Key, true, StrategyParams),
+    datastore_mnesia:update(Key, Value),
+    {_Key, DataInfoWithKey} = datastore_mnesia_data_info:read(Key),
+    DataInfo = DataInfoWithKey#data_info_with_key.value,
+    DataInfoWithTimeStamp = DataInfo#data_info{timestamp = Timestamp},
+    datastore_mnesia_data_info:update(Key, DataInfoWithTimeStamp),
+    {reply, {ok, "Updated replica"}, _State}.
 
 handle_cast(_Info, State) ->
     {noreply, State}.
@@ -151,14 +192,14 @@ get_other_dcs(DCs) ->
     end, DCs).
 
 get_replica_from_dc(DC, Key) ->
-    rpc:call(DC,replica_manager,read,[Key]).
+    rpc:call(DC, replica_manager, read, [Key]).
 
 get_replica_from_first_dc(_Key, []) ->
     {error, "Failed to get the key value"};
 
 get_replica_from_first_dc(Key, [H | T]) ->
     case get_replica_from_dc(H, Key) of
-        {ok, Value}  -> Value;
+        {ok, Value}  -> {ok, Value};
         {error, _}   -> get_replica_from_first_dc(Key, T)
     end
     .
