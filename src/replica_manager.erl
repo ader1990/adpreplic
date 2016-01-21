@@ -168,7 +168,7 @@ handle_call({add_dc_to_replica, Key, DC}, _From, Tid) ->
             {reply, {ok}, Tid};
         {error, _ErrorInfo} ->
             {ok, StrategyParams} = get_strategy(Key),
-            _Result = strategy_adprep:init_strategy(Key, true, StrategyParams),
+            _Result = strategy_adprep:init_strategy(Key, false, StrategyParams),
             datastore_mnesia_data_info:create(Key, #data_info{
                     replicated = false,
                     strength = 0.0,
@@ -198,6 +198,7 @@ handle_call({remove_dc_from_replica, Key, DC}, _From, Tid) ->
 
 handle_call({read, Key}, _From, Tid) ->
     lager:info("Read data item with key: ~p", [Key]),
+    {ok, _StrategyParams} = get_strategy(Key),
     Result = datastore_mnesia:read(Key),
     case Result of
         {error, _ErrorMessage} ->
@@ -210,6 +211,23 @@ handle_call({read, Key}, _From, Tid) ->
                     DCsWithKey = inter_dc_manager:get_other_dcs(DCs),
                     lager:info("Key present on ~p", [DCsWithKey]),
                     ResultKeyValue = inter_dc_manager:read_from_any_dc(Key, DCsWithKey),
+                    strategy_adprep:init_strategy(Key, false, _StrategyParams),
+                    {ok, ShouldReplicate} = strategy_adprep:local_read(Key),
+                    case ShouldReplicate of
+                        true ->
+                            lager:info("Key ~p should local replicate", [Key]),
+                            {ok, {_, ValueProxy}} = ResultKeyValue,
+                            datastore_mnesia:create(Key, ValueProxy),
+                            DataInfoUpdated = DataInfo#data_info{
+                                replicated = true,
+                                strength = _StrategyParams#strategy_params.repl_threshold,
+                                dcs = DCs ++ [node()]
+                            },
+                            datastore_mnesia_data_info:update(Key, DataInfoUpdated),
+                            _SendResult = inter_dc_manager:send_data_item_location(Key);
+                        false ->
+                            lager:info("Key ~p should not local replicate", [Key])
+                    end,
                     {reply, ResultKeyValue, Tid};
                 {error, _ErrorInfo} ->
                     {reply, {error, _ErrorMessage}, Tid};
@@ -218,8 +236,7 @@ handle_call({read, Key}, _From, Tid) ->
                     {reply, {error, _Info}, Tid}
             end;
         {ok, KeyValue} ->
-            {ok, StrategyParams} = get_strategy(Key),
-            _Result = strategy_adprep:init_strategy(Key, true, StrategyParams),
+            strategy_adprep:init_strategy(Key, true, _StrategyParams),
             strategy_adprep:local_read(Key),
             {reply, {ok, KeyValue}, Tid}
     end;
@@ -260,13 +277,30 @@ handle_call({update, Key, Value}, _From, Tid) ->
 
 handle_call({remove, Key}, _From, Tid) ->
     lager:info("Remove data item with key: ~p", [Key]),
-    %% TO DO
-    %% Remove DC from other DCs data retrieval storage
-    {_, Pid, _, _} = sys:get_status(list_to_atom(Key)),
-    strategy_adprep:stop(Pid),
-    datastore_mnesia:remove(Key),
-    datastore_mnesia_data_info:remove(Key),
-    {reply, {ok}, Tid}.
+
+    Result = datastore_mnesia_data_info:read(Key),
+    case Result of
+        {ok, DataInfoWithKey} ->
+            {ok, StrategyParams} = get_strategy(Key),
+            strategy_adprep:init_strategy(Key, true, StrategyParams),
+            datastore_mnesia:remove(Key),
+            DataInfo = DataInfoWithKey#data_info_with_key.value,
+            DCsNew = inter_dc_manager:get_other_dcs(DataInfo#data_info.dcs),
+            DataInfoUpdated = DataInfo#data_info{
+                replicated = false,
+                strength = 0.0,
+                dcs = DCsNew
+            },
+            inter_dc_manager:signal_remove_replica_from_dc(DCsNew, Key),
+            datastore_mnesia_data_info:update(Key, DataInfoUpdated),
+            {reply, {ok}, Tid};
+        {error, ErrorInfo} ->
+            lager:info("Failure: ~p", [ErrorInfo]),
+            {reply, {error, ErrorInfo}, Tid};
+        Info ->
+            lager:info("Failure: ~p", [Info]),
+            {reply, {error, Info}, Tid}
+    end.
 
 handle_cast(shutdown, Tid) ->
     lager:info("Shutting down the replica manager"),
@@ -288,14 +322,14 @@ code_change(_OldVersion, State, _Extra) ->
 
 get_strategy(_Key) ->
     StrategyParams = #strategy_params{
-    decay_time     = 5,
-    repl_threshold = 100.0,
-    rmv_threshold  = 50.0,
-    max_strength   = 300.0,
-    decay_factor   = 10.0,
-    rstrength      = 10.0,
-    wstrength      = 20.0,
-    min_dcs_number = 8
+        decay_time     = 5,
+        repl_threshold = 100.0,
+        rmv_threshold  = 50.0,
+        max_strength   = 300.0,
+        decay_factor   = 20.0,
+        rstrength      = 50.0,
+        wstrength      = 100.0,
+        min_dcs_number = 1
     },
     {ok, StrategyParams}.
 

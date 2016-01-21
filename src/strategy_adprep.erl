@@ -102,14 +102,15 @@ stop(Pid) ->
 -spec init({key(), boolean(), strategy_params()}) -> {ok, strategy_state()}.
 init({Key, Replicated,
         #strategy_params{
-            decay_time       = DecayTime, 
+            decay_time       = DecayTime,
             repl_threshold   = ReplThreshold,
-            wstrength        = WStrength} = StrategyParams })->
+            wstrength        = WStrength,
+            min_dcs_number = _MinimumDCsNumber} = StrategyParams })->
 
     lager:info("Initiating replication strategy with Replicated: ~p",
         [Replicated]),
     % Calculate strength of the replica
-    Strength = case Replicated of 
+    Strength = case Replicated of
         true  -> ReplThreshold + WStrength;
         false -> 0.0
     end,
@@ -169,21 +170,45 @@ handle_call(get_strength, _From, {#strategy_state{strength=Strength}=StrategySta
 
 handle_call(stop, _From, State) -> {stop, normal, ok, State}.
 
-handle_cast(decay,
-    {#strategy_state{key=Key, strength=Strength, replicated=Replicated, 
-    params=#strategy_params{rmv_threshold=RmvThreshold, 
-    decay_factor=DecayFactor}}=StrategyState}) ->
+handle_cast(decay, #strategy_state{
+        key = Key,
+        strength   = Strength,
+        replicated = Replicated,
+        timer      = Timer,
+        params     = #strategy_params{
+            rmv_threshold = RmvThreshold,
+            decay_factor = DecayFactor,
+            min_dcs_number = MinimumDCsNumber
+            }
+        }=StrategyState) ->
     % Time decay
     NewStrength = decrStrength(Strength, DecayFactor),
     ShouldStopReplicate = (RmvThreshold > NewStrength) and Replicated,
     % Notify replication manager if replica should not longer be replicated
-    _ = case ShouldStopReplicate of true -> 
-        lager:info("Below replication threshold for key ~p",[Key]),
-        replica_manager:remove_replica(Key);
-        false -> ok
-    end,
-   {noreply, StrategyState#strategy_state{strength=NewStrength}}.
-
+    _ = case ShouldStopReplicate of
+        true ->
+            lager:info("Remove replication threshold for key ~p is met ~p",
+                [Key, RmvThreshold]),
+            {ok, DataInfoWithKey} = datastore_mnesia_data_info:read(Key),
+            DataInfo = DataInfoWithKey#data_info_with_key.value,
+            lager:info("~p ~p is len ~p",
+                [MinimumDCsNumber, DataInfo#data_info.dcs, length(DataInfo#data_info.dcs)]),
+            KeepReplica = MinimumDCsNumber < length(DataInfo#data_info.dcs),
+            case KeepReplica of
+                true ->
+                    replica_manager:remove_replica(Key),
+                    decay:stopDecayTimer(Timer),
+                    strategy_adprep:stop(self()),
+                    {noreply, StrategyState#strategy_state{strength=0.0}};
+                false ->
+                    lager:info("Remove replication min number of DCS not met"),
+                    {noreply, StrategyState#strategy_state{strength=NewStrength}}
+            end;
+        false ->
+            lager:info("Data item should not be removed. Replicated status: ~p. Strength: ~p. Remove threshsold: ~p",
+                [Replicated, NewStrength, RmvThreshold]),
+            {noreply, StrategyState#strategy_state{strength=NewStrength}}
+    end.
 
 %% @doc Does nothing.
 handle_info(_Msg, State) ->
